@@ -1,0 +1,1138 @@
+---
+title: "Predicting Redistribution Preferences"
+author: "Matias Strehl"
+date: "December, 2022"
+output: 
+  bookdown::html_document2:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    number_sections: true
+    fig_caption: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, message = F, warning = F}
+# Load packages
+library(tidyverse)
+library(janitor)
+library(dplyr)
+library(lubridate)
+library(magrittr)
+library(ggplot2)
+library(kableExtra)
+library(modelsummary)
+library(gt)
+library(haven)
+library(fixest)
+library(tidymodels)
+library(ISLR)
+library(ISLR2)
+library(tidyverse)
+library(glmnet)
+library(discrim)
+library(corrplot)
+library(klaR)
+library(patchwork)
+library(bookdown)
+tidymodels_prefer()
+
+library(rpart.plot)
+library(vip)
+library(randomForest)
+library(xgboost)
+
+devtools::install_github("haozhu233/kableExtra")
+
+set.seed(17)
+```
+
+# Introduction
+Economists have made great efforts to understand what shape people redistribution preferences. In this paper, I will apply a Machine Learning approach to predict redistribution preferences of workers in Uruguay. To do that, I exploit novel survey data on workers' social and economic preferences, combined with individual tax records that allow to accurately obtain measures of redistribution preferences, behavioral parameters and beliefs that the literature point as key determinants of redistribution preferences, sociodemographic characteristics, and other characteristics of workers' jobs.
+
+The paper is organized as follows. Section 2 describes the data set, performs some data cleaning, and provides data visualization; Section 3 performs three different approaches to predict redistribution preferences: validation set approach, cross-validation and regularization; Section 4 performs three different tree-based approaches to predict redistribution preferences: pruned single tree, random forest, and boosted tree models; Section 5 compares the performance of two selected models in the testing set; finally, Section 6 concludes.
+
+# Data
+
+## Description of the data
+
+This paper use a combination of survey data and tax records that can be linked at the individual level. 
+
+On the one hand, survey data comes from the Encuesta de Preferencias sociales y Economicas (EPSE), which is a survey carried out in Uruguay in 2019 with data about social and economic preferences of workers. This data set allows us to have accurate measures of redistribution preferences -- the outcome of interest of this paper--, behavioral parameters, other beliefs and opinions, and some sociodemographic characteristics that will be used as predictors. 
+
+On the other hand, administrative tax records have rich individual-level data about wages, capital income, job characteristics, taxes, and some sociodemographic characteristics, for the 2009-2016 period.
+
+I leverage the possibility of linking these two data sets at the individual level, which constitutes a unique empirical setting, to try to predict redistribution preferences of workers in Uruguay.
+
+I now briefly describe the main variables I use in the paper. First, the outcome of interest is *redistribution preferences*. To measure this outcome I use a categorical variable that takes on 4 values according to the answer to the following question: *How much do you agree with the following statement?* "The government should take actions to reduce inequality between rich and poor people", where the possible answers are "Totally agree", "Partially agree", "Partially disagree" and "Totally disagree". For simplicity of the analysis, I create a binary variable that takes the value 1 if the individual is totally agree with the statement, and 0 otherwise. Hence, I measure the outcome of interest with this binary variable that indicates whether the individual fully supports redistribution or not. 
+
+Second, the explanatory variables or predictors that I use in the paper are divided into three groups, with all of them being potential predictors for redistribution preferences, according to the literature. The first group of predictors consists of sociodemographic characteristics that come both from survey and from tax records. These variables are sex (*gender*), age (*age*), education attainment (*education*), income (*total_income_2016*), and an indicator of whether the individual receives capital income or not (*i_capital*).
+
+The second group consists of behavioral parameters captured by laboratory games that individuals perform in the survey. These variables are risk aversion (*risk_aversion*), impatience (*impatience*), altruism (*altruism*), inequality aversion (*inequality_aversion*), trust in others (*trust_game*), tolerance for inequality (*ineq_tolerance*), and reciprocity/rationalism (*ultimatum*).
+
+Finally, the last group of predictors consists of beliefs and opinions that come from survey questions. These variables are meritocratic beliefs (*meritocratic_pref*), perceived mobility (*perceived_mobility*), perceived inequality (*perceived_inequality*), trust in government (*trust_gov*), perceived government efficiency (*gov_efficiency*), and political ideology (*political_ideology*). 
+
+Note: for simplicity, all numeric predictors are standarized so they have a mean of zero and a standard deviation of one when working with models. Besides, all predictors that are not dummy variables are treated as numerical.
+
+
+## Data Cleaning
+
+Before starting the analysis, it is worth to perform some data cleaning. Regarding missing values, the survey measures do not suffer from this problem, but it is worth to check whether administrative data variables have missing values or not. We observe that neither *total_income_2016* nor *i_capital* -- the two variables we will use from administrative data -- have missing values. Then, we select only the variables we will use to predict our outcome of interest, and rename some of them in order to have more intuitive names for the analysis. Finally, we change the binary variables to factors.
+
+```{r, message = F, warning = F}
+
+# Load data
+raw_data <- read_dta("Wide_2009_2016_ready_survey.dta")
+
+# Check number of missing values of variables from administrative data
+sum(is.na(raw_data$total_income_2016))
+sum(is.na(raw_data$i_capital))
+
+# Keep only the variables I will use for prediction and change some variable names
+data <- raw_data %>%
+  select(pref_redistribution, total_income_2016, age, gender, education, i_capital,
+         risk_aversion, impatience_share, dictator_reg, inequality_aversion, 
+         trust_game, merit_pref_reg, ultimatum,
+         meritocratic_pref, perc_mobility_reg,
+         perceived_inequality, trust_gov, gov_efficiency, political_ideology) %>%
+  mutate(gender = ifelse(gender==2,1,0)) %>%
+  rename(impatience = impatience_share,
+         altruism = dictator_reg,
+         ineq_tolerance = merit_pref_reg,
+         perceived_mobility = perc_mobility_reg)  # Change column names to a more intuitive name
+
+# Create the outcome of interest
+data <- data %>%
+  mutate(pref_red_new = ifelse(pref_redistribution == 4, "favor", "against" )) %>%
+  select(-pref_redistribution) %>%
+  rename(pref_redistribution = pref_red_new)
+
+# Change every discrete variable to factors
+data_character <- data %>%
+  select(-total_income_2016, -age) %>% # create a vector with every discrete variable for histograms
+  colnames()
+
+# For histograms we factor all discrete variables
+data_histograms <- data %>%
+  mutate(across(data_character, ~ as.factor(.))) # change them to factors
+
+data_histograms$pref_redistribution <- factor(data$pref_redistribution, levels = c("favor", "against")) # reorder outcome of interest
+
+# Change some variables to factors in the main data
+factors_vector <- data %>% 
+  select(pref_redistribution, gender, i_capital, inequality_aversion, trust_game, ultimatum) %>%
+  colnames()  # create auxiliar vector with variables to change to factors
+
+data <- data %>%
+  mutate(across(factors_vector, ~ as.factor(.) )) # change some variables to factor
+
+data$pref_redistribution <- factor(data$pref_redistribution, levels = c("favor", "against")) # reorder outcome of interest
+
+#levels(data$pref_redistribution)
+
+```
+
+## Data Visualization
+
+Figure \@ref(fig:red-hist) shows the distribution of redistribution preferences, the outcome of interest of the paper. We can see that 40% of the sample supports higher redistribution levels, while 60\% do not. 
+
+```{r red-hist, message = F, warning = F, fig.cap = "Distribution of redistribution preferences"}
+# Histogram of redistribution preferences
+data %>%
+ggplot(aes(x=pref_redistribution, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("In favor", "Against")) +
+  labs(x = "Redistribution preferences",
+       y = "Percentage") +
+  theme_minimal()
+```
+
+Next, we present the distribution of the predictors. First, we present the distribution of sociodemographic variables. Figure \@ref(fig:sociodemographics) and Table \@ref(tab:summ-stats) show the distribution of these variables. We can see that income is -- as expected -- right skewed since there are several high-income outliers, and that the annual income mean is close to 1 million Uruguayan pesos (the median is almost 750,000 Uruguayan pesos). Notice that the sample is representative of the richest half of the Uruguayan workforce. Also, since this is a sample of workers, most participants are over 18 years old, where the average age is 41 years old. Women and highly educated people are over-represented in the sample, as we can observe that 60% of the sample are women and the average education level is higher than 5, which means that, on average, the sample is college educated. Finally, only 9% of the sample have capital income. This is expected, since capital income is highly concentrated on a rich and small portion of the population. 
+
+```{r sociodemographics, message = F, warning = F, fig.cap = "Distribution of sociodemographic predictors"}
+
+# Sociodemographic plots
+inc_boxplot <- data_histograms %>%
+  ggplot(aes(x = total_income_2016)) +
+  geom_boxplot(fill = "coral2", color = "coral4", alpha = 0.7) +
+  labs(
+    title = "Distribution of Income",
+    x = "Number of cylinders",
+    y = "Income in pesos" ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(size=7) )
+
+
+inc_density <- data_histograms %>%
+  filter(total_income_2016<30000000) %>%
+  ggplot(aes(x = total_income_2016)) +
+  geom_density(color = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Income",
+    x = "Income in pesos",
+    y = "" ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(size=7) )
+
+
+age_density <- data_histograms %>%
+  ggplot(aes(x = age)) +
+  geom_density(color = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Age",
+    x = "Age",
+    y = "") +
+  theme_classic() +
+  theme(axis.text.x = element_text(size=7) )
+
+sex_hist <- data_histograms %>%
+  ggplot(aes(x=gender, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Male", "Female")) +
+  labs(title = "Sex",
+       x = "Sex",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+
+edu_hist <- data_histograms %>%
+  ggplot(aes(x=education, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Elementary \n incomplete", "Elementary \n complete",
+                              "High School \n incomplete", "High School \n complete",
+                              "College \n incomplete", "College \n complete", 
+                              "Master/PhD")) +
+    labs(title = "Education",
+       x = "Education level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=4, angle=45) )
+
+capital_hist <- data_histograms %>%
+  ggplot(aes(x = i_capital, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Not \n capitalist", "Capitalist")) +
+  labs(title = "Capitalist",
+       x = "",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+  
+inc_density + capital_hist + age_density + sex_hist + edu_hist 
+
+```
+
+```{r summ-stats, message = F, warning = F}
+
+variable_names <- data %>%
+  colnames()
+
+data_numeric <- data %>%
+  mutate(across(variable_names, ~ as.numeric(.) )) %>%
+  mutate(i_capital = ifelse(i_capital==2, 100, 0)) %>%
+  mutate(gender = ifelse(gender==2, 100, 0)) %>%
+  select(`Income` = total_income_2016,
+         `Capitalists (%)` = i_capital,
+         `Age` = age, `Female (%)` = gender,
+         `Education level` = education)
+
+
+# Table with summary statistics
+table_1 <- datasummary(`Income` + `Capitalists (%)` +
+                        `Age` + `Female (%)` + `Education level`
+                        ~ (Mean + SD),
+                       data = data_numeric,
+                       fmt = 1,
+                       output = "data.frame")
+  
+kbl(table_1,
+    caption = "<center>Summary statistics of sociodemographic predictors",
+    booktabs = TRUE,
+    escape = FALSE,
+    align = "lcc") %>%
+  kable_classic(full_width = T)
+  
+
+
+
+```
+
+
+Figure \@ref(fig:behavioral-hist) presents the distribution of behavioral parameters. These parameters are all measured by variables that come from laboratory games of the survey data. The figure shows that, on average, the sample is quite risk averse, impatience levels are evenly-distributed across the sample, the majority has high levels of altruism, the sample is highly inequality averse, half of the participants decide to trust in others in the trust game, tolerance for inequality is concentrated at the medium level, and, finally, most of the sample accept a low offer in the ultimatum game.
+
+
+```{r behavioral-hist, message = F, warning = F, fig.cap = "Distribution of behavioral predictors"}
+
+# Behavioral parameters plots
+
+# Hist
+risk_hist <- data_histograms %>%
+  ggplot(aes(x=risk_aversion, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Low", "", "", "", "", "High")) +
+  labs(title = "Risk aversion",
+       x = "Risk aversion level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7))
+
+# Hist
+impatience_hist <- data_histograms %>%
+  ggplot(aes(x=impatience, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Low", "", "", "", "", "High")) +
+  labs(title = "Impatience",
+       x = "Impatience level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+# Hist
+altruism_hist <- data_histograms %>%
+  ggplot(aes(x=altruism, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Low", "Medium", "High")) +
+  labs(title = "Altruism",
+       x = "Altruism level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+# Hist
+ineq_aversion_hist <- data_histograms %>%
+  ggplot(aes(x=inequality_aversion, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Tolerant", "Averse")) +
+  labs(title = "Inequality aversion",
+       x = "Inquality aversion level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7))
+
+# Hist
+trust_hist <- data_histograms %>%
+  ggplot(aes(x=trust_game, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Does not \n trust", "Trust")) +
+  labs(title = "Trust game",
+       x = "Trust level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+# Hist
+ineq_tolerance_hist <- data_histograms %>%
+  ggplot(aes(x=ineq_tolerance, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Low", "Medim", "High")) +
+  labs(title = "Tolerance for inequality",
+       x = "Tolerance level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+# Hist
+ultimatum_hist <- data_histograms %>%
+  ggplot(aes(x=ultimatum, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Reject", "Accept")) +
+  labs(title = "Reciprocity/rationalism",
+       x = "Answer to low offer in Ultimatum",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+# Plot behavioral parameters
+risk_hist + impatience_hist + altruism_hist + ineq_aversion_hist +
+  trust_hist + ineq_tolerance_hist + ultimatum_hist
+
+```
+
+Finally, Figure \@ref(fig:beliefs-hist) shows the distribution of the last group of predictors: beliefs and opinions. We observe that 60% of the participants have weak meritocratic beliefs, more than 40% perceive that the mobility level is low, and more than 80% believe that inequality levels are too high. Besides this, approximately 80% of the participants have either medium or low levels of trust in government, while almost no one thinks that the government is highly efficient. Lastly, 49.4% of the participants place themselves on the left wing of the left-right political spectrum, 22.7% are on the right wing, and the remaining 27.9% place themselves at the center.
+
+```{r beliefs-hist, message = F, warning = F, fig.cap = "Distribution of beliefs and opinions"}
+
+# Plot beliefs and opinions 
+meritocratic_hist <- data_histograms %>%
+  ggplot(aes(x = meritocratic_pref, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Weak", "Medium", "Strong")) +
+  labs(title = "Meritocratic beliefs",
+       x = "Level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+mobility_hist <- data_histograms %>%
+  ggplot(aes(x = perceived_mobility, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Low", "Medium", "High")) +
+  labs(title = "Perceived mobility",
+       x = "Level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+perc_ineq_hist <- data_histograms %>%
+  ggplot(aes(x = perceived_inequality, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Too \n Low", "Adequate", "Too \n high")) +
+  labs(title = "Perceived inequality",
+       x = "Level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+trust_gov_hist <- data_histograms %>%
+  ggplot(aes(x = trust_gov, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Low", "", "", "", "High")) +
+  labs(title = "Trust in Government",
+       x = "Level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+gov_efficiency_hist <- data_histograms %>%
+  ggplot(aes(x = gov_efficiency, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Low", "", "", "High")) +
+  labs(title = "Perceived Government \n efficiency",
+       x = "Level",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+ideology_hist <- data_histograms %>%
+  ggplot(aes(x = political_ideology, y = (..count..)/sum(..count..) )) +
+  geom_bar(color = "coral4", fill = "coral2", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  scale_x_discrete(labels = c("Left", "", "", "", "", "Center", "",
+                              "", "", "", "Right")) +
+  labs(title = "Political ideology",
+       x = "",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size=7) )
+
+# Plot beliefs and opinions
+meritocratic_hist + mobility_hist + perc_ineq_hist + trust_gov_hist +
+  gov_efficiency_hist + ideology_hist
+
+```
+
+For prediction purposes, it is relevant to understand the potential correlations of all these variables. Figure \@ref(fig:corr-matrix) presents a correlation matrix for all the variables (both predictors and the outcome of interest).
+
+```{r corr-matrix, message = F, warning = F, fig.cap = "Correlation Matrix"}
+
+# Create a correlation matrix between all variables
+data_predictors <- data %>%
+  select(-pref_redistribution)
+
+auxiliar <- data %>%
+  mutate(aux = ifelse(pref_redistribution=="favor", 1, 0)) %>%
+  select(aux) %>%
+  rename(pref_redistribution = aux)
+
+# All variables to numeric
+corr_matrix <- data.frame(lapply(data_predictors, function(x) as.numeric(as.character(x))))
+corr_matrix <- bind_cols(corr_matrix, auxiliar)
+
+# Correlation matrix of all predictors and pref_redistribution
+corrplot(cor(corr_matrix), method = 'circle', order = "AOE", type = "lower", 
+         diag = FALSE, tl.srt = 45, tl.col = "black", tl.cex = 0.5,
+        addCoef.col = 'black',  number.cex = 0.4)
+  
+```
+
+Figure \@ref(fig:corr-matrix) shows that, overall, these variables are not highly correlated. Regarding the outcome of interest, redistribution preferences, we observe that supporting higher redistribution levels is positively correlated with having positive opinions of the government (both trust and efficiency perception), with the perceived level of inequality, and with higher levels of altruism. On the other hand, supporting more redistribution is negatively correlated with more right-win political ideology positions, higher meritocratic preferences, higher inequality tolerance, and higher perceived levels of income mobility. Overall, all these correlations have the expected sign, according to the theory and past evidence. 
+
+Between the predictors, those that are highly positively correlated are trust in government and government efficiency, income and age, income and education level, right-win political ideology and meritocratic preferences, perceived mobility and meritocratic preferences, perceived mobility and right-win political ideology. On the other hand, the predictors that are highly negatively correlated are right-win political ideology and government opinions (trust and perceived efficiency) and perceived inequality, meritocratic preferences and government opinions (both trust and perceived efficiency) and perceived inequality. Again, these correlations between predictors have the expected sign. 
+
+# Choosing the best model
+
+In this section, I split the data into a training and a testing set, what will allow to work with Machine Learning techniques throughout the rest of the paper. In order to balance the distribution of the outcome of interest, we stratify by redistribution preferences when splitting the data. Also, we choose the proportions so the training set contains 70% of the observations and the testing set contains the remaining 30%.
+
+```{r, message = F, warning = F}
+
+# Split the data
+data_split <- initial_split(data, prop = 0.7, strata = "pref_redistribution" )
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+# Check dimensions of train and test sets
+dim(data_train)
+dim(data_test)
+```
+We observe that the training set contains 5196 observations and the testing set 2228 observations, which correspond to 70% and 30% of the total sample, respectively, as expected.
+
+## Validation set approach
+
+In this section, I will asses the performance of three different models to predict redistribution preferences: logistic regression (LOGISTIC), linear discriminant analysis (LDA) and quadratic discriminant analysis (QDA), using the validation set approach.
+
+To do that, before doing any analysis, we first create a recipe and set the regression model and workflow for each of the three specified models.
+
+```{r, message = F, warning = F}
+
+# Create a recipe
+my_recipe <- recipe(pref_redistribution ~ 
+                      total_income_2016 + age + gender + education +
+         risk_aversion + impatience + altruism + inequality_aversion + trust_game +
+         ineq_tolerance + ultimatum + meritocratic_pref + perceived_mobility +
+         perceived_inequality + trust_gov + gov_efficiency + political_ideology,
+         data = data_train) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+# Logit model
+logit_model <- logistic_reg() %>% 
+  set_engine("glm") %>% 
+  set_mode("classification")
+
+# Logit workflow
+logit_workflow <- workflow() %>%
+  add_model(logit_model) %>% 
+  add_recipe(my_recipe)
+
+# LDA model
+lda_model <- discrim_linear() %>%
+  set_mode("classification") %>% 
+  set_engine("MASS")
+
+# LDA workflow 
+lda_workflow <- workflow() %>%
+  add_model(lda_model) %>%
+  add_recipe(my_recipe)
+
+# QDA model
+qda_model <- discrim_quad()  %>%
+  set_mode("classification") %>%
+  set_engine("MASS")
+
+# QDA workflow
+qda_workflow <- workflow() %>% 
+  add_model(qda_model) %>% 
+  add_recipe(my_recipe)
+
+```
+We can, now, fit these models to the entire training set and asses their performance. This is known as the validation set approach. Even though we know that a much better way of choosing the best model is to use cross validation and/or regularization, this is still a good exercise so we can appreciate the differences. 
+
+```{r validation-acc, message = F, warning = F}
+
+# Fit the 3 models to the training set
+logit_fit <- fit(logit_workflow, data_train)
+lda_fit <- fit(lda_workflow, data_train)
+qda_fit <- fit(qda_workflow, data_train)
+
+# Predict redistribution preferences
+logit_pred <- predict(logit_fit, new_data = data_train, type = "prob")
+lda_pred <- predict(lda_fit, new_data = data_train, type = "prob")
+qda_pred <- predict(qda_fit, new_data = data_train, type = "prob")
+
+# Measure accuracy of the models
+logit_acc <- augment(logit_fit, new_data = data_train) %>%
+  accuracy(truth = pref_redistribution, estimate = .pred_class)
+
+lda_acc <- augment(lda_fit, new_data = data_train) %>%
+  accuracy(truth = pref_redistribution, estimate = .pred_class)
+
+qda_acc <- augment(qda_fit, new_data = data_train) %>%
+  accuracy(truth = pref_redistribution, estimate = .pred_class)
+
+# Construct a table with accuracy of the models
+name_models <- c("Logistic", "LDA", "QDA")
+acc_validation <- c(logit_acc$.estimate, lda_acc$.estimate, qda_acc$.estimate) %>%
+  as_tibble() %>%
+  rename("Accuracy" = value) %>%
+  mutate("Model" = name_models) %>%
+  mutate_if(is.numeric, format, digits = 3)
+
+# Change order of columns and change 
+acc_validation <- acc_validation[, c("Model", "Accuracy")]
+
+
+# Nice Table of the assessment of the models
+kbl(acc_validation,
+    caption = "<center> Accuracy of the models",
+    booktabs = TRUE,
+    escape = FALSE,
+    align = "lcc") %>%
+  kable_classic(full_width = F)
+
+```
+
+Table \@ref(tab:validation-acc) shows the accuracy prediction level of the three models in the training set. We can see that the LOGISTIC model and the LDA achieve the highest level of accuracy, based on the validation approach. This means that if we have to choose the best-performing model based on the validation approach, the LOGISTIC model or the LDA are the ones that do the best job in terms of accuracy, predicting the right category of redistribution preferences 73.8% and 73.9% of the time, respectively.
+
+```{r conf-mat-1, message = F, warning = F, fig.cap = "Confusion matrix of logistic model"}
+
+# Confusion matrix of selected model
+augment(logit_fit, new_data = data_train) %>%
+  conf_mat(truth = pref_redistribution, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+
+```
+
+By plotting the confusion matrix of the LOGISTIC model in Figure \@ref(fig:conf-mat-1), we observe that from those that are against more redistribution (3119), this model correctly predicts 81.7% of them (2547), while from those that are in favor of more redistribution (2077), the logit model correctly predicts 62.1% of them (1290). Overall, the model does a better job in predicting those that are against redistribution than those that are in favor of it.
+
+
+## K-fold Cross-validation
+
+In this section, I proceed to asses the models' performance based on a more sophisticated re-sampling approach, known as cross validation, in order to get a better estimation of the true MSE. To do that, I split the training set into 5 folds. Note that I am fitting 3 models per each fold, so I am fitting a total of 15 models.
+
+```{r, message = F, warning = F, include = FALSE}
+
+# k-fold cross validation with k = 10
+data_fold <- vfold_cv(data_train, v = 5)
+data_fold
+
+# Fit the models to the folded data
+logit_res <- tune_grid(object = logit_workflow, resamples = data_fold)
+lda_res <- tune_grid(object = lda_workflow, resamples = data_fold)
+qda_res <- tune_grid(object = qda_workflow, resamples = data_fold)
+
+```
+
+Now, I can collect metrics for each model in order to asses their performance.
+
+```{r, message = F, warning = F}
+# Collect metrics: mean and standard errors
+logit_metrics <- collect_metrics(logit_res)
+lda_metrics <- collect_metrics(lda_res)
+qda_metrics <- collect_metrics(qda_res)
+
+#logit_metrics
+#lda_metrics
+#qda_metrics
+
+# Construct a table with metrics of the model
+name_models <- c("Logistic", "LDA", "QDA") %>%
+               as_tibble() %>%
+              rename("Model" = value)
+
+acc_res <- c(logit_metrics$mean[1], lda_metrics$mean[1],
+                    qda_metrics$mean[1]) %>%
+           as_tibble() %>%
+           rename("Accuracy" = value) %>%
+           mutate_if(is.numeric, format, digits = 3)
+
+roc_res <- c(logit_metrics$mean[2], lda_metrics$mean[2],
+                    qda_metrics$mean[2]) %>%
+          as_tibble() %>%
+          rename("ROC-AUC" = value) %>%
+          mutate_if(is.numeric, format, digits = 3)
+
+res_table <- bind_cols(name_models, acc_res, roc_res)
+
+# Nice Table of the assessment of the models
+kbl(res_table,
+    caption = "<center> Mean Accuracy and ROC-AUC of the models in the folds",
+    booktabs = TRUE,
+    escape = FALSE,
+    align = "lcc") %>%
+  kable_classic(full_width = F)
+
+```
+
+Based on the table, we observe that the best-performing models in terms of average accuracy and ROC-AUC are, again, the LOGISTIC and LDA models. Since the accuracy of the LDA model is slightly greater than LOGISTIC's accuracy, but the opposite happens regarding ROC-AUC, I conclude that both the LOGISTIC and LDA model are the best-performing models based on to the cross-validation approach.
+
+## Regularization
+
+In this section, I take the LOGISTIC model and use hyperparameter tuning in order to find the model that performs the best through regularization. To do that, I use grid search looking only at evenly spaced parameter values. In particular, I create a regular grid for penalty and mixture with 10 levels each; mixture ranges from 0 to 1, and I let penalty range from -5 to 5. When fitting these models to the folded data, we will be fitting 100 models per fold, that is, we will be fitting a total of 500 models.
+
+
+```{r reg-logit, message = F, warning = F, fig.cap="Regularization and model performance"}
+# Set model
+elastic_net_spec <- logistic_reg(penalty = tune(),
+                                 mixture = tune()) %>%
+                    set_mode("classification") %>%
+                    set_engine("glmnet") 
+# Set workflow
+en_wkflow <- workflow() %>%
+             add_recipe(my_recipe) %>%
+             add_model(elastic_net_spec)
+          
+# Grid
+en_grid <- grid_regular(penalty(range = c(-5,5)),
+                        mixture(range = c(0,1)),
+                        levels = 10)
+
+# Fit the model to the folded data
+#tune_res <- tune_grid(
+#              en_wkflow,
+#              resamples = data_fold,
+#              grid = en_grid
+#)
+
+# Save the results
+#saveRDS(tune_res, file = "tune_res_saved.RData")
+
+tune_res_saved <- readRDS("tune_res_saved.RData")
+autoplot(tune_res_saved)
+
+```
+
+In the figure we observe that lower amounts of regularization produce better accuracy and better ROC-AUC. For low amounts of regularization, it seems that lower proportion of Lasso Penalty produce better accuracy, while for high amounts of regularization, lower proportion of Lasso Penalty produce both better accuracy and better ROC-AUC. Now, we can choose the model that performs best. To do that, we will use the ROC-AUC criterium. When selecting the best-performing tuned model, we could use either accuracy or ROC-AUC criterium. They give different tune parameters, but really similar accuracy and ROC-AUC levels. Therefore, I will use the ROC-AUC criterium to select the best-performing model in the folded data, and fit it to the whole training data.
+
+
+```{r, message = F, warning = F}
+
+# Show best models based on ROC-AUC
+roc_auc_regularized <- collect_metrics(tune_res_saved) %>%
+  arrange(desc(mean)) 
+
+roc_auc_regularized %>% head()
+
+# Choose the best model
+best_model <- select_best(tune_res_saved, metric = "roc_auc")
+#best_model
+```
+
+Notice that following the ROC-AUC criterium, the best model is one with really low amount of regularization and with the lowest possible proportion of Lasso Penalty (Ridge regression). Now that we have chosen the best-performing model, we can proceed to fit that model to the whole training set, and then, just as an exercise to compare in the future, we can use it to predict redistribution preferences in the testing set. This does not mean that we are choosing this one as the best-performing model of the paper. In fact, we will see that tree-based models do a slightly better prediction job. Therefore, fitting the model to the testing set is only an illustrative exercise.
+
+```{r reg-test, message = F, warning = F}
+# Update/finalize recipe using the best model
+en_final <- finalize_workflow(en_wkflow, best_model)
+
+# Fit the best model to the whole training set
+en_final_fit <- fit(en_final, data = data_train)
+
+# Apply the model to the testing set
+predicted_data <- augment(en_final_fit, new_data = data_test) %>%
+  select(pref_redistribution, starts_with(".pred"))
+
+# Table with assessment
+acc_en <- predicted_data %>%
+  accuracy(truth = pref_redistribution, estimate = .pred_class) # accuracy
+
+acc_table <-  acc_en$.estimate[1] %>%
+  as_tibble() %>%
+  rename(Accuracy = value)
+
+roc_auc_en <- predicted_data %>%
+  roc_auc(truth = pref_redistribution, estimate = .pred_favor) # ROC-AUC
+
+roc_auc_table <- roc_auc_en$.estimate[1] %>%
+  as_tibble() %>%
+  rename("ROC-AUC" = value)
+
+en_table <- bind_cols(acc_table, roc_auc_table) %>%
+            mutate_if(is.numeric, format, digits = 3)
+
+kbl(en_table,
+    caption = "<center> Assessment of the best regularized model in the testing set",
+    booktabs = TRUE,
+    escape = FALSE,
+    align = "cc") %>%
+  kable_classic(full_width = F)
+
+```
+
+In Table \@ref(tab:reg-test), we observe that the best-regularized model correctly predicts 74.6% of the observations in the testing set, while it achieves a ROC-AUC of 0.8. We can also plot the ROC-AUC curve.
+
+```{r reg-roc, message = F, warning = F, fig.cap="ROC-AUC curve of best-regularized model on testing data"}
+
+# Create plot ROC curve
+predicted_data %>%
+  roc_curve(truth = pref_redistribution, estimate = .pred_favor) %>%
+  autoplot()
+
+```
+
+```{r reg-matrix, message = F, warning = F, fig.cap="Confusion matrix of regularized model in the testing data" }
+
+# Confusion matrix
+predicted_data %>%
+  conf_mat(truth = pref_redistribution, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+
+```
+
+
+Figure \@ref(fig:reg-matrix) shows the confusion matrix of the best-regularized model on the testing data. By looking at this matrix, we observe that among those observations that are in favor of more redistribution (891), the model correctly predicts 63.1% (562), and among those observations that are against more redistribution (1337), the model correctly predicts 82.2% (1099).
+
+# Tree-based analysis
+
+In this section, I perform a tree-based analysis to predict redistribution preferences. Specifically, I first perform a pruned single decision tree; second, I perform a random forest model and; finally, I perform a boosted tree model.
+
+## Single pruned decision tree
+
+To perform this analysis, I tune the cost_complexity hyperparameter using the same levels we used in class, that is, range = c(-3,-1), and I specify that the metric I want to optimize is ROC-AUC.
+
+```{r prune-parameter, message = F, warning = F, fig.cap="Model performance vs Cost-complexity Parameter"}
+
+# Set engine
+tree_spec <- decision_tree() %>%
+  set_engine("rpart")
+
+# Set model
+class_tree_spec <- tree_spec %>%
+  set_mode("classification")
+
+# Set workflow
+class_tree_wkflow <- workflow() %>%
+             add_recipe(my_recipe) %>%
+             add_model(class_tree_spec %>%
+                         set_args(cost_complexity = tune()) )
+
+# Set cost complexity hyperparameter tuning
+param_grid <- grid_regular(cost_complexity(range = c(-3, -1)), levels = 10)
+
+# Fit the model to the folded data
+#tune_res_tree <- tune_grid(
+#  class_tree_wkflow,
+#  resamples = data_fold,
+#  grid = param_grid,
+#  metrics = metric_set(roc_auc)
+#)
+
+# Save the results
+#saveRDS(tune_res_tree, file = "tune_res_tree_saved.RData")
+
+tune_res_tree_saved <- readRDS("tune_res_tree_saved.RData")
+
+# Plot the result
+autoplot(tune_res_tree_saved)
+```
+
+In Figure \@ref(fig:prune-parameter) one can observe that, for lower values of Cost-complexity parameter, the ROC-AUC is increasing in this parameter, and at a certain point, the ROC-AUC starts to be decreasing in this parameter. Now, we can proceed to select the best-performing model in the folded data, based on the ROC-AUC criterium.
+
+```{r, message = F, warning = F}
+
+# Observe ROC-AUC of best model
+roc_auc_pruned <- collect_metrics(tune_res_tree_saved) %>%
+  arrange(desc(mean))
+
+#roc_auc_pruned
+
+# Select best pruned single tree
+best_model_pruned <- select_best(tune_res_tree_saved, metric = "roc_auc")
+
+class_tree_final <- finalize_workflow(class_tree_wkflow, best_model_pruned)
+
+class_tree_final_fit <- fit(class_tree_final, data = data_train)
+
+```
+
+We observe that the best performing pruned single tree model has a Cost-complexity Parameter of 0.0017 and achieves an average ROC-AUC of 0.764 in the folded data. Figure \@ref(fig:pruned-tree) shows the decision tree using the best pruned single tree model.
+
+```{r pruned-tree, message = F, warning = F, fig.cap="Best pruned single tree model"}
+
+# Visualize
+class_tree_final_fit %>%
+  extract_fit_engine() %>%
+  rpart.plot()
+```
+
+
+## Random forest model
+
+Now, I perform a random forest model to predict redistribution preferences. To do that, I set a regular grid of 8 levels, where the number of predictors to be randomly sampled at each split when creating the models ranks from 1 to 17 (17 implies a bagging model), the number of trees ranks from 10 to 2000, and the minimum number of data points in a node that are required for the node to be split further ranks from 10 to 80.
+
+```{r, message = F, warning = F}
+
+# Set Random forest model
+rf_spec <- rand_forest(mtry = tune(), trees = tune(), min_n = tune() ) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# Set workflow
+rf_wkflow <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(rf_spec)
+
+# Create regular grids
+model_grid <- grid_regular(mtry(range = c(1,17)), trees(range = c(10, 2000)),
+                           min_n(range =c(10, 80)), levels = 8 )  
+```
+
+Now, we can fit the random forest to the folded data.
+
+```{r rf, message = F, warning = F, fig.cap="RF performance"}
+
+# Tune the model
+#tune_res_rf <- tune_grid(
+#  rf_wkflow,
+#  resamples = data_fold,
+#  grid = model_grid,
+#  metrics = metric_set(roc_auc)
+#)
+
+#Save the results as an R object so we don't run it again every time we knit
+#saveRDS(tune_res_rf, file="tune_res_rf_saved.RData")
+
+tune_res_rf_saved <- readRDS("tune_res_rf_saved.RData")
+
+autoplot(tune_res_rf_saved)
+
+```
+
+
+In Figure \@ref(fig:rf) we observe that, at first, ROC-AUC values are increasing in the number of predictors, and at a certain point, this relationship becomes negative. We also observe that models with 10 trees always have a relative bad performance, amd that models with a higher number of trees tend to do better. Regarding minimal node size, there are no big differences. It seems that for greater minimal node sizes, the relationship between ROC-AUC and number of selected predictors is flatter. We can now proceed to observe the best-performing models.
+
+```{r, message = F, warning = F}
+# Take a look to the best-performing models
+roc_auc_rf <- collect_metrics(tune_res_rf_saved) %>%
+  arrange(desc(mean))
+
+roc_auc_rf %>% head()
+
+```
+
+
+Using the ROC-AUC criterium, we get that the best-performing model in the folds is one with 3 randomly selected predictors, 294 trees, and with 70 minimal node size. This model achieves a ROC-AUC of 0.8 in the folded data. Now, we can fit this best-performing model to the whole training data and analyze the importance of the different predictors. 
+
+```{r rf-vip, message = F, warning = F, fig.cap="Variable importance of the best-performing RF model in the training set"}
+
+# Select the best model
+best_model_rf <- select_best(tune_res_rf_saved, metric = "roc_auc")
+
+# Select the final specification based on the best model
+rf_final_spec <- rand_forest(mtry = best_model_rf$mtry,
+                             trees = best_model_rf$trees, 
+                             min_n = best_model_rf$min_n ) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# Specify the regression and training data: I do this instead of using the old recipe
+# because it seems that the vip() function does not work with it. So I specify here
+# the same specification I used before but without using a recipe.
+
+# factors_vector is an auxiliar vector with predictors that are factors
+factors_vector <- data %>%
+  select(gender, i_capital, inequality_aversion, trust_game, ultimatum) %>%
+  colnames()
+# numeric variables auxiliar vector
+numeric_vector <- data  %>%
+  select(-pref_redistribution, -gender, -i_capital, -inequality_aversion, -trust_game, -ultimatum) %>%
+  colnames()
+  
+data_train_b <- data_train %>%
+  mutate(across(factors_vector, ~ as.numeric(.) )) %>% # factors to numeric
+  mutate(gender = ifelse(gender==2,1,0)) %>% # create dummy
+  mutate(i_capital = ifelse(i_capital==2,1,0)) %>% # create dummy
+  mutate(inequality_aversion = ifelse(inequality_aversion==2,1,0)) %>% # create dummy
+  mutate(trust_game = ifelse(trust_game==2,1,0))  %>% # create dummy
+  mutate(ultimatum = ifelse(ultimatum==2,1,0)) # create dummy
+
+
+# standarize numeric variables so they have mean = 0 and SD = 1
+data_train_b <- data_train_b %>%
+  mutate_at(numeric_vector, ~(scale(.) %>% as.vector))
+  
+  
+rf_final_spec_fit <- fit(rf_final_spec, pref_redistribution ~ 
+                           total_income_2016 + age + gender + education +
+         risk_aversion + impatience + altruism + inequality_aversion + trust_game +
+         ineq_tolerance + ultimatum + meritocratic_pref + perceived_mobility +
+         perceived_inequality + trust_gov + gov_efficiency + political_ideology,
+         data = data_train_b)
+
+# Variable importance visualization
+vip(rf_final_spec_fit)
+
+```
+
+Figure \@ref(fig:rf-vip) shows that the most important variable to predict redistribution preferences in the training set is, by far, political ideology. This makes sense, since redistribution preferences are probably the most important difference between left and right-wing individuals, at least in terms of economic factors. Second, meritocratic beliefs are also relevant, which also makes sense, because if people believe in the meritocratic system, then individuals are responsible of their own outcomes, and no redistribution would be needed. This is shown to be one of the most powerful predictors of redistribution preferences in the Economics' literature. Next, opinions about the government seems to be important too (both trust and perceived efficiency). Finally, other variables like perceived inequality, income, age, perceived mobility, education, and impatience, also seem to play a relevant role. 
+
+
+## Boosted trees
+
+The last exercise of the paper consists of fitting a boosted tree model. To do that, I set a regular grid of 20 levels, and I let the trees range vary from 1 to 100 (after having checked that including greater number of trees only creates really low ROC-AUC values).
+
+```{r boosted-tree, message = F, warning = F, fig.cap="Boosted tree model"}
+
+# Boosted specification
+boost_spec <- boost_tree(trees = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# Set up workflow
+boost_wkflow <- workflow() %>%
+  add_model(boost_spec) %>%
+  add_recipe(my_recipe)
+
+# Create regular grids 
+#boost_grid <- grid_regular(trees(range = c(10,2000)), levels = 10)
+boost_grid <- grid_regular(trees(range = c(1,100)), levels = 20)
+
+# Tuning the Boosted model
+tune_res_boosted <- tune_grid(
+  boost_wkflow,
+  resamples = data_fold,
+  grid = boost_grid,
+  metrics = metric_set(roc_auc)
+)
+
+saveRDS(tune_res_boosted, file="tune_res_boosted_saved.RData")
+
+tune_res_boosted_saved <- readRDS("tune_res_boosted_saved.RData")
+
+autoplot(tune_res_boosted_saved)
+
+```
+
+Figure \@ref(fig:boosted-tree) shows that ROC_AUC is at first increasing in the number of trees, but this relationship quickly becomes negative for more than 10 trees. I can now proceed to select the best-performing boosted tree model in the folds. This model has 6 trees and achieves a ROC-AUC of 0.793.
+
+```{r, message = F, warning = F}
+
+# Best-performing boosted tree model
+roc_auc_boosted_rf <- collect_metrics(tune_res_boosted_saved) %>%
+  arrange(desc(mean))
+
+roc_auc_boosted_rf %>% head()
+
+# Select the best model
+best_model_boosted <- select_best(tune_res_boosted_saved, metric = "roc_auc")
+
+```
+
+
+# Assessment of the models and fit to the testing set
+
+In this section, I compare the four main best models I used throughout the paper, based on the ROC-AUC criterium in the folded data: the regularized logistic regression, the single tree, the random forest and the boosted tree. Last, I fit the best-performing model to the testing data and assess its performance.
+
+```{r model-assessment, message = F, warning = F}
+
+# Compare regularized, single tree, rf, boosted tree
+
+# Table comparing the roc_auc of the best performing models
+model_name <- c("Regularized model", "Pruned single tree",
+                "Random Forest","Boosted tree")
+
+roc_auc_trees <- c(roc_auc_regularized$mean[1], roc_auc_pruned$mean[1], roc_auc_rf$mean[1],
+                   roc_auc_boosted_rf$mean[1]) %>%
+  as_tibble() %>%
+  rename("ROC-AUC" = value) %>%
+  mutate(Model = model_name) %>%
+  mutate_if(is.numeric, format, digits = 3)
+
+roc_auc_trees <- roc_auc_trees[, c("Model", "ROC-AUC")]
+
+# Table
+kbl(roc_auc_trees,
+    caption = "<center> Assessment of the main models in the folds",
+    booktabs = TRUE,
+    escape = FALSE,
+    align = "lc") %>%
+  kable_classic(full_width = F)
+
+
+```
+
+
+Table \@ref(tab:model-assessment) compares ROC-AUC levels for four models: the regularized logistic regression, the pruned single tree, the random forest, and the boosted tree. We observe that the random forest model achieves the highest ROC-AUC, so we conclude that this is the best-performing model of the paper in the folds. 
+
+Now, we can finally fit the best model to the whole training set, and assess its performance in predicting redistribution preferences in the testing set.
+
+```{r, message = F, warning = F}
+
+# Finalize/update workflow with the best model
+final_rf <- finalize_workflow(rf_wkflow, best_model_rf) # rf is the best model, and we had selected in this object the best-performing rf before
+
+# Fit it to the training set
+final_fit <- fit(final_rf, data = data_train)
+
+# Predict in the testing set
+predicted_test <- augment(final_fit, new_data = data_test) %>%
+  select(pref_redistribution, starts_with(".pred"))
+
+# Print roc-auc of the model
+#predicted_test %>%
+#  roc_auc(truth = pref_redistribution, estimate = .pred_favor)
+
+# Table with assessment
+acc_rf <- predicted_test %>%
+  accuracy(truth = pref_redistribution, estimate = .pred_class) # accuracy
+
+acc_rf_table <-  acc_rf$.estimate[1] %>%
+  as_tibble() %>%
+  rename(Accuracy = value)
+
+roc_auc_rf <- predicted_test %>%
+  roc_auc(truth = pref_redistribution, estimate = .pred_favor) # ROC-AUC
+
+roc_auc_rf_table <- roc_auc_rf$.estimate[1] %>%
+  as_tibble() %>%
+  rename("ROC-AUC" = value)
+
+models_name <- c("Regularized model", "Random Forest") %>%
+  as_tibble() %>%
+  rename(Model = value)
+
+rf_table <- bind_cols(acc_rf_table, roc_auc_rf_table) %>%
+            mutate_if(is.numeric, format, digits = 3)
+
+final_rows <- bind_rows(en_table, rf_table)
+
+final_table <- bind_cols(models_name, final_rows)
+
+kbl(final_table,
+    caption = "<center> Assessment of the models in the testing set",
+    booktabs = TRUE,
+    escape = FALSE,
+    align = "lcc") %>%
+  kable_classic(full_width = F)
+
+
+```
+
+We observe that the ROC-AUC of the best random forest model in the testing set is of 0.806, while it achieves an accuracy of 74.6%. Compared to the regularized logistic regression that we fitted to the testing set in Section 3, the random forest model does a slightly better job in both accuracy and ROC-AUC level in the testing set. Figure \@ref(fig:roc-test) plots the ROC-AUC curve of the random forest model for a complete analysis.
+
+
+```{r roc-test, message = F, warning = F, fig.cap="ROC-AUC curve of the best RF model in the testing set"}
+
+# Print the ROC curve
+predicted_test %>%
+  roc_curve(truth = pref_redistribution, estimate = .pred_favor) %>% 
+  autoplot()
+
+```
+Figure \@ref(fig:matrix-test) presents the confusion matrix of this model in the testing set. We observe that, among those that are in favor of redistribution in the testing set (891), the model correctly predicts 60% of them (540). On the other hand, among those that are against redistribution in the testing set (1337), the model correctly predicts 84.5% of them (1130). Compared to the exercise we did when we fitted the regularized logistic regression to the testing set, the random forest does a relatively worst job in predicting those that are in favor, but a better job in predicting those that are against redistribution in the testing set.
+
+
+```{r matrix-test, message = F, warning = F, fig.cap="Confusion matrix of best RF in the testing set"}
+
+# Confusion matrix heatmap
+predicted_test %>%
+  conf_mat(truth = pref_redistribution, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+
+```
+Overall, the random forest model does a slightly better job in predicting redistribution preferences in the testing set compared to the regularized logistic regression. The random forest model was the best-performing model in the folds, and it is, therefore, the best-performing model of the paper. We compare its performance in the testing set with the best regularized model just as an illustrative exercise.
+
+# Conclusion 
+
+In this paper, I exploited a combination of survey data and tax records in order to predict redistribution preferences of workers in Uruguay using Machine Learning approaches. The paper is split into two main analysis. The first analysis attempts to choose among a logistic regression, a linear discriminant analysis and a quadratic discriminant analysis. I analyzed the performance of these models based on the validation set approach, cross-validation and, finally, regularization. The second analysis, on the other hand, consists of predicting redistribution preferences using tree-based methods. Specifically, I performed a pruned single tree, a random forest, and a boosted tree model. 
+
+In the first part of the analysis, both LOGISTIC and LDA stand as the best-performing models in the folds. In the second part of the analysis, the random forest model stands as the best-performing model in the folds. Over all the models, the random forest is the best-performing model in the folded data.
+
+As a final exercise, I fitted the random forest model to the testing set and, only as an exercise, I also fitted the regularized logistic model. Overall, the random forest model achieves an accuracy of 75% and a ROC-AUC of 0.806. 
+
+As a final comment, given that this model does a slightly better job in predicting redistribution preferences, both in terms of accuracy and ROC-AUC level in the testing set, relative to the regularized LOGISTIC model, the gains of performing a random forest model are not obvious. This is because random forest models are computationally-demanding compared to the simpler regularized logistic models, and in this exercise, the gains in terms of performance are not significant in magnitude. Even though the random forest performed slightly better, both models had a similar performance, so a simpler regularized LOGISTIC regression does almost as good job as the random forest in prediciting redistribution preferences in the present study.
+
