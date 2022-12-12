@@ -54,6 +54,8 @@ set.seed(17)
 # Introduction
 Economists have made great efforts to understand what shape people redistribution preferences. In this paper, I will apply a Machine Learning approach to predict redistribution preferences of workers in Uruguay. To do that, I exploit novel survey data on workers' social and economic preferences, combined with individual tax records that allow to accurately obtain measures of redistribution preferences, behavioral parameters and beliefs that the literature point as key determinants of redistribution preferences, sociodemographic characteristics, and other characteristics of workers' jobs.
 
+To do that, I will perform two main analysis. First, I use validation set, cross-validation and regularization to choose the best-performing model between a LOGISTIC, a Linear Discrimant Analysis, and a Quadratic Discriminant Analysis. Second, I use tree-based approach. Particularly, I perform a pruned single tree, a random forest, and a boosted tree, and use cross-validation to choose the best-performing model. Next, I compare the performance of all the models in the folds in order to choose the best-performing model. Finally, I fit the best model to the testing set and assess its predicting performance.
+
 The paper is organized as follows. Section 2 describes the data set, performs some data cleaning, and provides data visualization; Section 3 performs three different approaches to predict redistribution preferences: validation set approach, cross-validation and regularization; Section 4 performs three different tree-based approaches to predict redistribution preferences: pruned single tree, random forest, and boosted tree models; Section 5 compares the performance of two selected models in the testing set; finally, Section 6 concludes.
 
 # Data
@@ -603,7 +605,7 @@ By plotting the confusion matrix of the LOGISTIC model in Figure \@ref(fig:conf-
 
 ## K-fold Cross-validation
 
-In this section, I proceed to asses the models' performance based on a more sophisticated re-sampling approach, known as cross validation, in order to get a better estimation of the true MSE. To do that, I split the training set into 5 folds. Note that I am fitting 3 models per each fold, so I am fitting a total of 15 models.
+In this section, I proceed to asses the models' performance based on a more sophisticated re-sampling approach, known as cross validation, in order to get a better estimation of the true MSE. To do that, I split the training set into 5 folds. Note that I am fitting 3 models per each fold, so I am fitting a total of 15 models. For each model, this process will take 4 of the 5 folds in the training data, fit the model and then use the left-out fold as a "testing set". It will repeat the process leaving out each of the 5 folds and, finally, we collect the average performance of each model in the folds. This process is better than the former because it is less dependent on the particular split of the data.
 
 ```{r, message = F, warning = F, include = FALSE}
 
@@ -697,7 +699,7 @@ autoplot(tune_res_saved)
 
 ```
 
-In the figure we observe that lower amounts of regularization produce better accuracy and better ROC-AUC. For low amounts of regularization, it seems that lower proportion of Lasso Penalty produce better accuracy, while for high amounts of regularization, lower proportion of Lasso Penalty produce both better accuracy and better ROC-AUC. Now, we can choose the model that performs best. To do that, we will use the ROC-AUC criterium. When selecting the best-performing tuned model, we could use either accuracy or ROC-AUC criterium. They give different tune parameters, but really similar accuracy and ROC-AUC levels. Therefore, I will use the ROC-AUC criterium to select the best-performing model in the folded data, and fit it to the whole training data.
+In the figure we observe that lower amounts of regularization produce better accuracy and better ROC-AUC. For low amounts of regularization, it seems that lower proportion of Lasso Penalty produce better accuracy, while for high amounts of regularization, lower proportion of Lasso Penalty produce both better accuracy and better ROC-AUC. Now, we can choose the model that performs best. To do that, we will use the ROC-AUC criterium. When selecting the best-performing tuned model, we could use either accuracy or ROC-AUC criterium. They give different tune parameters, but really similar accuracy and ROC-AUC levels. Therefore, I will use the ROC-AUC criterium to select the best-performing model in the folded data.
 
 
 ```{r, message = F, warning = F}
@@ -713,68 +715,8 @@ best_model <- select_best(tune_res_saved, metric = "roc_auc")
 #best_model
 ```
 
-Notice that following the ROC-AUC criterium, the best model is one with really low amount of regularization and with the lowest possible proportion of Lasso Penalty (Ridge regression). Now that we have chosen the best-performing model, we can proceed to fit that model to the whole training set, and then, just as an exercise to compare in the future, we can use it to predict redistribution preferences in the testing set. This does not mean that we are choosing this one as the best-performing model of the paper. In fact, we will see that tree-based models do a slightly better prediction job. Therefore, fitting the model to the testing set is only an illustrative exercise.
+Notice that following the ROC-AUC criterium, the best model is one with really low amount of regularization and with the lowest possible proportion of Lasso Penalty (Ridge regression). 
 
-```{r reg-test, message = F, warning = F}
-# Update/finalize recipe using the best model
-en_final <- finalize_workflow(en_wkflow, best_model)
-
-# Fit the best model to the whole training set
-en_final_fit <- fit(en_final, data = data_train)
-
-# Apply the model to the testing set
-predicted_data <- augment(en_final_fit, new_data = data_test) %>%
-  select(pref_redistribution, starts_with(".pred"))
-
-# Table with assessment
-acc_en <- predicted_data %>%
-  accuracy(truth = pref_redistribution, estimate = .pred_class) # accuracy
-
-acc_table <-  acc_en$.estimate[1] %>%
-  as_tibble() %>%
-  rename(Accuracy = value)
-
-roc_auc_en <- predicted_data %>%
-  roc_auc(truth = pref_redistribution, estimate = .pred_favor) # ROC-AUC
-
-roc_auc_table <- roc_auc_en$.estimate[1] %>%
-  as_tibble() %>%
-  rename("ROC-AUC" = value)
-
-en_table <- bind_cols(acc_table, roc_auc_table) %>%
-            mutate_if(is.numeric, format, digits = 3)
-
-kbl(en_table,
-    caption = "<center> Assessment of the best regularized model in the testing set",
-    booktabs = TRUE,
-    escape = FALSE,
-    align = "cc") %>%
-  kable_classic(full_width = F)
-
-```
-
-In Table \@ref(tab:reg-test), we observe that the best-regularized model correctly predicts 74.6% of the observations in the testing set, while it achieves a ROC-AUC of 0.8. We can also plot the ROC-AUC curve.
-
-```{r reg-roc, message = F, warning = F, fig.cap="ROC-AUC curve of best-regularized model on testing data"}
-
-# Create plot ROC curve
-predicted_data %>%
-  roc_curve(truth = pref_redistribution, estimate = .pred_favor) %>%
-  autoplot()
-
-```
-
-```{r reg-matrix, message = F, warning = F, fig.cap="Confusion matrix of regularized model in the testing data" }
-
-# Confusion matrix
-predicted_data %>%
-  conf_mat(truth = pref_redistribution, estimate = .pred_class) %>%
-  autoplot(type = "heatmap")
-
-```
-
-
-Figure \@ref(fig:reg-matrix) shows the confusion matrix of the best-regularized model on the testing data. By looking at this matrix, we observe that among those observations that are in favor of more redistribution (891), the model correctly predicts 63.1% (562), and among those observations that are against more redistribution (1337), the model correctly predicts 82.2% (1099).
 
 # Tree-based analysis
 
@@ -1062,10 +1004,6 @@ final_fit <- fit(final_rf, data = data_train)
 predicted_test <- augment(final_fit, new_data = data_test) %>%
   select(pref_redistribution, starts_with(".pred"))
 
-# Print roc-auc of the model
-#predicted_test %>%
-#  roc_auc(truth = pref_redistribution, estimate = .pred_favor)
-
 # Table with assessment
 acc_rf <- predicted_test %>%
   accuracy(truth = pref_redistribution, estimate = .pred_class) # accuracy
@@ -1081,19 +1019,19 @@ roc_auc_rf_table <- roc_auc_rf$.estimate[1] %>%
   as_tibble() %>%
   rename("ROC-AUC" = value)
 
-models_name <- c("Regularized model", "Random Forest") %>%
+models_name <- c("Random Forest") %>%
   as_tibble() %>%
   rename(Model = value)
 
 rf_table <- bind_cols(acc_rf_table, roc_auc_rf_table) %>%
             mutate_if(is.numeric, format, digits = 3)
 
-final_rows <- bind_rows(en_table, rf_table)
+#final_rows <- bind_rows(en_table, rf_table)
 
-final_table <- bind_cols(models_name, final_rows)
+final_table <- bind_cols(models_name, rf_table)
 
 kbl(final_table,
-    caption = "<center> Assessment of the models in the testing set",
+    caption = "<center> Assessment of the RF in the testing set",
     booktabs = TRUE,
     escape = FALSE,
     align = "lcc") %>%
@@ -1102,7 +1040,7 @@ kbl(final_table,
 
 ```
 
-We observe that the ROC-AUC of the best random forest model in the testing set is of 0.806, while it achieves an accuracy of 74.6%. Compared to the regularized logistic regression that we fitted to the testing set in Section 3, the random forest model does a slightly better job in both accuracy and ROC-AUC level in the testing set. Figure \@ref(fig:roc-test) plots the ROC-AUC curve of the random forest model for a complete analysis.
+We observe that the ROC-AUC of the best random forest model in the testing set is of 0.806, while it achieves an accuracy of 74.6%. Figure \@ref(fig:roc-test) plots the ROC-AUC curve of the random forest model for a complete analysis.
 
 
 ```{r roc-test, message = F, warning = F, fig.cap="ROC-AUC curve of the best RF model in the testing set"}
@@ -1113,8 +1051,7 @@ predicted_test %>%
   autoplot()
 
 ```
-Figure \@ref(fig:matrix-test) presents the confusion matrix of this model in the testing set. We observe that, among those that are in favor of redistribution in the testing set (891), the model correctly predicts 60% of them (540). On the other hand, among those that are against redistribution in the testing set (1337), the model correctly predicts 84.5% of them (1130). Compared to the exercise we did when we fitted the regularized logistic regression to the testing set, the random forest does a relatively worst job in predicting those that are in favor, but a better job in predicting those that are against redistribution in the testing set.
-
+Figure \@ref(fig:matrix-test) presents the confusion matrix of this model in the testing set. We observe that, among those that are in favor of redistribution in the testing set (891), the model correctly predicts 60% of them (540). On the other hand, among those that are against redistribution in the testing set (1337), the model correctly predicts 84.5% of them (1130). 
 
 ```{r matrix-test, message = F, warning = F, fig.cap="Confusion matrix of best RF in the testing set"}
 
@@ -1124,7 +1061,7 @@ predicted_test %>%
   autoplot(type = "heatmap")
 
 ```
-Overall, the random forest model does a slightly better job in predicting redistribution preferences in the testing set compared to the regularized logistic regression. The random forest model was the best-performing model in the folds, and it is, therefore, the best-performing model of the paper. We compare its performance in the testing set with the best regularized model just as an illustrative exercise.
+
 
 # Conclusion 
 
@@ -1132,7 +1069,7 @@ In this paper, I exploited a combination of survey data and tax records in order
 
 In the first part of the analysis, both LOGISTIC and LDA stand as the best-performing models in the folds. In the second part of the analysis, the random forest model stands as the best-performing model in the folds. Over all the models, the random forest is the best-performing model in the folded data.
 
-As a final exercise, I fitted the random forest model to the testing set and, only as an exercise, I also fitted the regularized logistic model. Overall, the random forest model achieves an accuracy of 75% and a ROC-AUC of 0.806. 
+As a final exercise, I fitted the random forest model to the testing set and I found that it achieves an accuracy of 75% and a ROC-AUC of 0.806. 
 
-As a final comment, given that this model does a slightly better job in predicting redistribution preferences, both in terms of accuracy and ROC-AUC level in the testing set, relative to the regularized LOGISTIC model, the gains of performing a random forest model are not obvious. This is because random forest models are computationally-demanding compared to the simpler regularized logistic models, and in this exercise, the gains in terms of performance are not significant in magnitude. Even though the random forest performed slightly better, both models had a similar performance, so a simpler regularized LOGISTIC regression does almost as good job as the random forest in prediciting redistribution preferences in the present study.
+As a final comment, given that the random forest model does a slightly better job in predicting redistribution preferences, both in terms of accuracy and ROC-AUC level in the foldeds data, relative to the regularized LOGISTIC model, the gains of performing a random forest model are not obvious. This is because random forest models are computationally-demanding compared to the simpler regularized logistic models, and in this exercise, the gains in terms of performance are not significant in magnitude. Even though the random forest performed slightly better, both models had a similar performance, so a simpler regularized LOGISTIC regression does (almost) as good job as the random forest in predicting redistribution preferences in the present study.
 
